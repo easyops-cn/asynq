@@ -5,6 +5,7 @@
 package asynq
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -46,7 +47,24 @@ func newSubscriber(params subscriberParams) *subscriber {
 func (s *subscriber) shutdown() {
 	s.logger.Debug("Subscriber shutting down...")
 	// Signal the subscriber goroutine to stop.
-	s.done <- struct{}{}
+	close(s.done)
+}
+
+// Try until successfully connect to Redis.
+func (s *subscriber) tryUntilSuccessfullyPubSub() (pubsub *redis.PubSub, err error) {
+	for {
+		pubsub, err = s.broker.CancelationPubSub()
+		if err != nil {
+			s.logger.Errorf("cannot subscribe to cancelation channel: %v", err)
+			select {
+			case <-time.After(s.retryTimeout):
+				continue
+			case <-s.done:
+				return nil, errors.New("subscriber done")
+			}
+		}
+		return
+	}
 }
 
 func (s *subscriber) start(wg *sync.WaitGroup) {
@@ -57,21 +75,13 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 			pubsub *redis.PubSub
 			err    error
 		)
-		// Try until successfully connect to Redis.
-		for {
-			pubsub, err = s.broker.CancelationPubSub()
-			if err != nil {
-				s.logger.Errorf("cannot subscribe to cancelation channel: %v", err)
-				select {
-				case <-time.After(s.retryTimeout):
-					continue
-				case <-s.done:
-					s.logger.Debug("Subscriber done")
-					return
-				}
-			}
-			break
+
+		pubsub, err = s.tryUntilSuccessfullyPubSub()
+		if err != nil {
+			s.logger.Debug(err.Error())
+			return
 		}
+
 		cancelCh := pubsub.Channel()
 		for {
 			select {
@@ -79,7 +89,17 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 				pubsub.Close()
 				s.logger.Debug("Subscriber done")
 				return
-			case msg := <-cancelCh:
+			case msg, ok := <-cancelCh:
+				if !ok {
+					pubsub, err = s.tryUntilSuccessfullyPubSub()
+					if err != nil {
+						s.logger.Debug(err.Error())
+						return
+					}
+					cancelCh = pubsub.Channel()
+					continue
+				}
+
 				cancel, ok := s.cancelations.Get(msg.Payload)
 				if ok {
 					cancel()
